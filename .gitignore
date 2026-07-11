@@ -1,0 +1,29 @@
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Environment
+.env
+
+# IDE
+.vscode/
+
+# Logs
+*.log
+
+# Python cache
+*.pyo
+*.pyd
+
+# Laravel
+platform-glpi-main/vendor/
+platform-glpi-main/node_modules/
+platform-glpi-main/.env
+platform-glpi-main/public/build/
+
+# Laravel storage
+platform-glpi-main/storage/logs/*
+platform-glpi-main/bootstrap/cache/*.php
+platform-glpi-main/public/storage/

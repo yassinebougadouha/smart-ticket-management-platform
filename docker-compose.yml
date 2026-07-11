@@ -1,0 +1,221 @@
+services:
+  # ── PostgreSQL ─────────────────────────────────
+  support_postgres:
+    image: pgvector/pgvector:0.8.0-pg16
+    container_name: support_postgres
+    restart: always
+    environment:
+      POSTGRES_DB: laravel
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - sail
+
+  # ── Redis ──────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: support_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── FastAPI ────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: support_api
+    ports:
+      - "8600:8600"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@support_postgres:5432/laravel
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/2
+      CELERY_RESULT_BACKEND: redis://redis:6379/3
+      LIVEKIT_URL: ws://livekit:7880
+      BACKEND_API_URL: http://localhost:8600
+      VOICE_AGENTS_CONTROL_URL: http://livekit:8601
+      GLPI_API_URL: http://platform-glpi-main-laravel.test-1/api/v1
+      API_RELOAD: ${API_RELOAD:-false}
+      API_WORKERS: ${API_WORKERS:-4}
+    depends_on:
+      support_postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - default
+      - sail
+    volumes:
+      - .:/app
+      - ./recordings:/app/recordings
+    command: >
+      sh -c "alembic stamp 227af21ed124 --purge 2>/dev/null || true &&
+             alembic upgrade heads &&
+             if [ \"$$API_RELOAD\" = \"true\" ]; then
+               uvicorn app.main:app --host 0.0.0.0 --port 8600 --reload --reload-dir /app/app;
+             else
+               uvicorn app.main:app --host 0.0.0.0 --port 8600 --workers $$API_WORKERS;
+             fi"
+
+  # ── Celery Worker ──────────────────────────────
+  celery_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: support_celery_worker
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@support_postgres:5432/laravel
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/2
+      CELERY_RESULT_BACKEND: redis://redis:6379/3
+    depends_on:
+      support_postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - default
+      - sail
+    volumes:
+      - .:/app
+    command: python scripts/dev_celery.py worker
+
+  # ── Celery Beat (periodic scheduler) ─────────
+  celery_beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: support_celery_beat
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@support_postgres:5432/laravel
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/2
+      CELERY_RESULT_BACKEND: redis://redis:6379/3
+    depends_on:
+      support_postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    command: python scripts/dev_celery.py beat
+
+  # ── Flower (Celery monitoring) ─────────────────
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: support_flower
+    ports:
+      - "5555:5555"
+    env_file:
+      - .env
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/2
+      CELERY_RESULT_BACKEND: redis://redis:6379/3
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: celery -A app.workers.celery_app flower --port=5555
+
+  # ── WhatsApp Web Bridge (unofficial) ───────────
+  whatsapp_bridge:
+    build:
+      context: ./whatsapp-bridge
+      dockerfile: Dockerfile
+    container_name: support_whatsapp_bridge
+    ports:
+      - "8602:8602"
+    environment:
+      PORT: 8602
+      WEBHOOK_URL: http://api:8600/api/v1/whatsapp/bridge/webhook
+      API_KEY: ${WHATSAPP_BRIDGE_API_KEY:-}
+    volumes:
+      - wa_bridge_data:/data
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+
+  # ── LiveKit Server ─────────────────────────────
+  livekit:
+    image: livekit/livekit-server:latest
+    container_name: support_livekit
+    ports:
+      - "7880:7880" # HTTP / WebSocket (clients + agents connect here)
+      - "7881:7881" # RTC over TCP (fallback when UDP is blocked)
+      - "50000-50010:50000-50010/udp" # WebRTC media (UDP)
+    environment:
+      LIVEKIT_KEYS: "devkey: secret" # must match LIVEKIT_API_KEY / SECRET in .env
+    command: --dev --bind 0.0.0.0 --node-ip 127.0.0.1
+    restart: unless-stopped
+
+  # ── Voice Agents (LiveKit agent workers) ───────
+  voice_agents:
+    build:
+      context: .
+      dockerfile: voice_agents/Dockerfile
+    container_name: support_voice_agents
+    network_mode: "service:livekit"
+    env_file:
+      - .env
+    environment:
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-devkey}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-secret}
+      BACKEND_API_URL: http://api:8600
+      VOICE_AGENTS_CONTROL_PORT: 8601
+      LIVEKIT_URL: ws://localhost:7880
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@support_postgres:5432/laravel
+      INTERNAL_SERVICE_KEY: ${INTERNAL_SERVICE_KEY:-change-me-internal-key}
+      VOICE_RECORDINGS_DIR: /app/recordings
+      AI_RESPONSE_PROVIDER: ${AI_RESPONSE_PROVIDER:-gemini}
+      USE_REALTIME: ${USE_REALTIME:-false}
+      GOOGLE_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    depends_on:
+      livekit:
+        condition: service_started
+      support_postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
+    volumes:
+      - ./recordings:/app/recordings
+    command: sh -c "python voice_agents/control_api.py & python -m voice_agents start"
+    restart: unless-stopped
+
+networks:
+  default:
+    name: ai_support_network
+  sail:
+    external: true
+    name: platform-glpi-main_sail
+
+volumes:
+  pgdata:
+  redisdata:
+  wa_bridge_data:

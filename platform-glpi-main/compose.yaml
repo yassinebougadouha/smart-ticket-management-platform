@@ -1,0 +1,90 @@
+version: "3.8"
+
+services:
+  laravel.test:
+    build:
+      context: ./vendor/laravel/sail/runtimes/8.5
+      dockerfile: Dockerfile
+      args:
+        WWWGROUP: ${WWWGROUP}
+    image: sail-8.5/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${APP_PORT:-8605}:80"
+    environment:
+      WWWUSER: ${WWWUSER}
+      LARAVEL_SAIL: 1
+    volumes:
+      - .:/var/www/html
+    networks:
+      - sail
+      - ai_support_network
+
+  vite:
+    image: node:24-alpine
+    working_dir: /var/www/html
+    environment:
+      NODE_ENV: development
+    ports:
+      - "${VITE_PORT:-8610}:${VITE_PORT:-8610}"
+    volumes:
+      - .:/var/www/html
+    command: sh -c "if [ ! -d /var/www/html/node_modules ]; then npm install; fi && npm run dev -- --host 0.0.0.0 --port ${VITE_PORT:-8610}"
+    networks:
+      - sail
+
+  scheduler:
+    image: sail-8.5/app
+    restart: unless-stopped
+    user: root
+    working_dir: /var/www/html
+    volumes:
+      - .:/var/www/html
+    environment:
+      SUPERVISOR_PHP_USER: root
+    command: php artisan schedule:work
+    networks:
+      - sail
+      - ai_support_network
+
+  glpi_db:
+    image: mariadb:10.7
+    container_name: glpi_db
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: glpidb
+      MYSQL_USER: glpi
+      MYSQL_PASSWORD: glpipass
+    volumes:
+      - glpi_db_data:/var/lib/mysql
+    networks:
+      - sail
+
+  glpi:
+    image: diouxx/glpi
+    container_name: glpi_app
+    restart: always
+    ports:
+      - "8603:80"
+    environment:
+      TIMEZONE: Africa/Tunis
+    depends_on:
+      - glpi_db
+    volumes:
+      - glpi_data:/var/www/html/glpi
+    networks:
+      - sail
+
+networks:
+  sail:
+    driver: bridge
+  ai_support_network:
+    external: true
+
+volumes:
+  glpi_db_data:
+    external: true
+  glpi_data:
+    external: true
